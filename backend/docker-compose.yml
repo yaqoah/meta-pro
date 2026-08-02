@@ -1,0 +1,27 @@
+# Local development infrastructure for Meta-Pro.
+#
+# PostgreSQL is intentionally NOT defined here: persistent LangGraph state
+# checkpointing uses Supabase exclusively (see .env.example for the Supabase
+# Supavisor pooler connection string). There is no local Postgres container.
+#
+# Redis is OPTIONAL — it is only used for step-bound memory / queueing during
+# local development. The backend auto-degrades to in-memory state storage when
+# Redis is not running, and to a SQLite file / MemorySaver when DATABASE_URL is
+# empty, so `docker compose up` is never required to run the backend.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: metapro-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:

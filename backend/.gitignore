@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Meta-Pro backend — Python / FastAPI
+# ---------------------------------------------------------------------------
+
+# --- Virtual environments ------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Byte-compiled / optimized / DLL files -------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Distribution / packaging -------------------------------------------
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Test / coverage / lint / type-check caches --------------------------
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Environment files ---------------------------------------------------
+# Local secrets / overrides. The template (`.env.example`) stays tracked.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- SQLite checkpoint fallback (created when DATABASE_URL is unset) -----
+meta_pro.db
+meta_pro.db-wal
+meta_pro.db-shm
+*.db
+
+# --- Logs ----------------------------------------------------------------
+*.log
+
+# --- IDE / OS ------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

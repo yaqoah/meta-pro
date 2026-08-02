@@ -1,0 +1,19 @@
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+pydantic-settings
+typing-extensions
+instructor
+litellm
+langgraph
+# Optional checkpointer extras — the backend auto-falls back to in-memory
+# MemorySaver when neither is installed, so neither is required to run.
+langgraph-checkpoint-postgres
+langgraph-checkpoint-sqlite
+tenacity
+redis
+psycopg[binary]
+psycopg-pool
+python-multipart
+groq
+python-dotenv
