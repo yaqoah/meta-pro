@@ -33,6 +33,12 @@ T = TypeVar("T")
 # Logical model name resolved by LiteLLM to the [Mistral → Groq] failover group.
 LLM_ALIAS = "meta-pro-llm"
 
+# Shared LiteLLM Router resolving ``LLM_ALIAS`` to its deployment(s). The
+# alias mechanism only works through a Router — plain ``litellm.completion``
+# rejects unknown model names with ``BadRequestError: LLM Provider NOT
+# provided`` (the crash seen with Supabase + the SSE stream).
+_ROUTER: Any | None = None
+
 # instructor + litellm are imported lazily so the app can boot — and degrade
 # to deterministic routing / placeholder strategies — in minimal environments
 # where the provider SDKs are not installed (e.g. Dockerless local runs).
@@ -125,12 +131,22 @@ LLM_RETRY = Retrying(
 def _configure_litellm_router() -> None:
     """Route ``LLM_ALIAS`` to the primary model with optional failover.
 
-    The primary entry is Mistral. When ``GROQ_API_KEY`` is set, a second
-    entry sharing ``LLM_ALIAS`` is registered so LiteLLM treats the pair as
-    one failover group (Mistral → Groq on provider errors / timeouts). When
-    Groq is not configured, the router contains only Mistral — Groq is fully
-    optional. No-op when the LiteLLM SDK is not installed.
+    Builds a :class:`litellm.Router` whose ``model_list`` maps ``LLM_ALIAS``
+    to the primary model (Mistral). When ``GROQ_API_KEY`` is set, a Groq
+    deployment is registered under its own model name and wired in via
+    ``fallbacks``, so LiteLLM only uses it after the primary fails on a
+    provider error / timeout — preserving a strict *primary-then-fallback*
+    ordering (a shared alias across deployments would instead shuffle
+    requests between providers). When Groq is not configured, the router
+    holds only Mistral — Groq is fully optional. No-op when the LiteLLM SDK
+    is not installed.
+
+    A ``Router`` is required (not ``litellm.model_list`` + plain
+    ``litellm.completion``): the plain completion entrypoint cannot resolve
+    custom model names, while the Router resolves the alias to its
+    deployments.
     """
+    global _ROUTER
     if not _llm_stack_available():
         return
     import litellm
@@ -149,16 +165,24 @@ def _configure_litellm_router() -> None:
             ),
         },
     ]
+    fallbacks: list[dict] = []
     if settings.GROQ_API_KEY:
+        fallback_name = "meta-pro-llm-groq"
         model_list.append(
             {
-                "model_name": LLM_ALIAS,
+                "model_name": fallback_name,
                 "litellm_params": _params(
                     settings.FALLBACK_LLM_MODEL, settings.GROQ_API_KEY
                 ),
             }
         )
-    litellm.model_list = model_list
+        fallbacks.append({LLM_ALIAS: [fallback_name]})
+
+    _ROUTER = litellm.Router(
+        model_list=model_list,
+        fallbacks=fallbacks,
+        num_retries=0,  # tenacity owns the retry policy in this app
+    )
 
 
 if _llm_stack_available():
@@ -172,9 +196,14 @@ def _structured_completion(
 ) -> BaseModel:
     """Run a single structured completion via Instructor over LiteLLM."""
     import instructor
-    import litellm
 
-    client = instructor.from_litellm(litellm.completion)
+    if _ROUTER is None:
+        raise LLMUnavailableError(
+            "LLM provider stack (instructor/litellm) is unavailable — "
+            "degrading to deterministic placeholders"
+        )
+
+    client = instructor.from_litellm(_ROUTER.completion)
     return client.create(
         model=model,
         response_model=response_model,
