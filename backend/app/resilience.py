@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from typing import Any, Callable, Dict, TypeVar
 
 from pydantic import BaseModel
@@ -79,6 +80,17 @@ class LLMUnavailableError(SimulatedAPIError):
     """
 
 
+class ProviderUnavailableError(SimulatedAPIError):
+    """Raised when the upstream LLM provider errors out after retries.
+
+    Covers rate limits (HTTP 429), 5xx failures, timeouts and invalid
+    responses surfaced by LiteLLM / Instructor. Subclasses
+    :class:`SimulatedAPIError` so the graph's degradation handlers degrade
+    that node to deterministic placeholders instead of crashing the whole
+    run — a rate-limited or down provider must not kill the pipeline.
+    """
+
+
 class SchemaValidationError(Exception):
     """Models a corrupt/invalid payload rejected at worker handoff."""
 
@@ -126,6 +138,24 @@ LLM_RETRY = Retrying(
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
+
+# Consecutive-failure circuit breaker. Once the provider has failed
+# ``_BREAKER_LIMIT`` calls in a row, further LLM calls fast-fail for
+# ``_BREAKER_COOLDOWN`` seconds instead of burning backoff retries — so a
+# rate-limited (429) or down provider degrades the rest of the run to
+# placeholders quickly rather than stalling every node on 2s/4s sleeps.
+# The breaker re-arms the provider after the cooldown so a recovered key
+# is retried; any success resets the failure count.
+#
+# ``_BREAKER_LIMIT`` intentionally matches ``LLM_RETRY``'s
+# ``stop_after_attempt(3)`` so the trip lands on the final retry. The state
+# is process-global and not locked: for this single-user server the worst
+# case is one extra provider call (a non-atomic ``+=`` race under concurrent
+# requests) or a degraded request while another request is on cooldown.
+_BREAKER_LIMIT = 3
+_BREAKER_COOLDOWN = 30.0  # seconds
+_breaker_failures = 0
+_breaker_tripped_at: float | None = None
 
 
 def _configure_litellm_router() -> None:
@@ -204,14 +234,24 @@ def _structured_completion(
         )
 
     client = instructor.from_litellm(_ROUTER.completion)
-    return client.create(
-        model=model,
-        response_model=response_model,
-        messages=[{"role": "user", "content": prompt}],
-        max_retries=0,  # tenacity owns retries here
-        strict=False,  # broadest provider compat (Mistral/Groq via LiteLLM)
-        temperature=0.2,
-    )
+    try:
+        return client.create(
+            model=model,
+            response_model=response_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_retries=0,  # tenacity owns retries here
+            strict=False,  # broadest provider compat (Mistral/Groq via LiteLLM)
+            temperature=0.2,
+        )
+    except Exception as exc:
+        # Provider errors (429 rate limits, 5xx, timeouts, invalid
+        # responses) must degrade the pipeline node, not crash the run.
+        # Log the real cause so the server terminal shows why a node
+        # degraded (not just the frontend warning banner).
+        logger.warning("LLM provider call failed: %s", exc)
+        raise ProviderUnavailableError(
+            f"LLM provider call failed: {exc}"
+        ) from exc
 
 
 def _call_with_retries(fn: Callable[[], T]) -> T:
@@ -230,6 +270,13 @@ def call_llm_with_resilience(
     automatic Groq failover; that failover engages on real provider errors,
     while the retry policy below handles transient failures.
 
+    Provider failures (rate limits, 5xx, timeouts) are retried up to 3
+    times with exponential backoff, then surfaced as
+    :class:`ProviderUnavailableError` (a :class:`SimulatedAPIError`) so the
+    graph degrades that node to deterministic placeholders instead of
+    failing the run. After repeated consecutive failures a short circuit
+    breaker fast-fails the remaining nodes for the rest of the run.
+
     Chaos modes (mirror ``MetaProState["chaos_injection_flag"]``):
     - ``"API_FAILURE"``: raise :class:`SimulatedAPIError` (a 500) on the first
       two attempts so the exponential-backoff retry path fires before
@@ -244,6 +291,21 @@ def call_llm_with_resilience(
             "degrading to deterministic placeholders"
         )
 
+    # Circuit-breaker check *before* the retry loop: while the provider is
+    # on cooldown, every node degrades instantly instead of burning tenacity
+    # backoff sleeps (which would let the cooldown lapse mid-run and re-hit
+    # a rate-limited provider). Chaos runs bypass the breaker so their
+    # retry-then-succeed scenarios are exercised regardless of global state.
+    global _breaker_tripped_at
+    if chaos_flag is None and _breaker_tripped_at is not None:
+        if time.monotonic() - _breaker_tripped_at < _BREAKER_COOLDOWN:
+            raise ProviderUnavailableError(
+                "LLM provider on cooldown after repeated failures — "
+                "degrading to deterministic placeholders"
+            )
+        # Cooldown elapsed: re-arm the provider and try it for real.
+        _breaker_tripped_at = None
+
     attempts = {"n": 0}
 
     def _attempt() -> BaseModel:
@@ -253,7 +315,17 @@ def call_llm_with_resilience(
                 f"chaos API_FAILURE (attempt {attempts['n']}/3): "
                 "simulated 500 Internal Server Error"
             )
-        return _structured_completion(prompt, response_model)
+        global _breaker_failures, _breaker_tripped_at
+        try:
+            result = _structured_completion(prompt, response_model)
+        except Exception:
+            _breaker_failures += 1
+            if _breaker_failures >= _BREAKER_LIMIT:
+                _breaker_tripped_at = time.monotonic()
+                _breaker_failures = 0
+            raise
+        _breaker_failures = 0
+        return result
 
     result = _call_with_retries(_attempt)
 
