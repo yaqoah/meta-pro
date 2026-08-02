@@ -32,11 +32,21 @@ in the in-memory fallback — so they never depend on an external store.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
 
-from langgraph.checkpoint.base import BaseCheckpointSaver
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
+    Checkpoint,
+    CheckpointMetadata,
+    CheckpointTuple,
+    ChannelVersions,
+)
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
@@ -619,6 +629,83 @@ def build_checkpointer() -> BaseCheckpointSaver:
             from langgraph.checkpoint.postgres import PostgresSaver
             from psycopg.rows import dict_row
 
+            class _AsyncCompatiblePostgresSaver(PostgresSaver):
+                """Sync ``PostgresSaver`` that also satisfies the async API.
+
+                The SSE endpoint streams via ``astream_events``, which drives
+                ``AsyncPregelLoop`` — that loop requires async checkpoint
+                methods (``aget_tuple``, ``aput``, ``aput_writes``,
+                ``alist``). The plain sync ``PostgresSaver`` does not
+                implement them, so the base class raises
+                ``NotImplementedError`` on the very first checkpoint read
+                (the ``workflow streaming failed`` traceback seen with
+                Supabase). This subclass delegates each async method to its
+                sync implementation through ``asyncio.to_thread``. A lock
+                serializes access to the single shared psycopg connection,
+                which is not thread-safe under concurrent requests. All sync
+                entry points (``/run``, ``/api/history``) are untouched.
+                """
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self._db_lock = asyncio.Lock()
+
+                async def aget_tuple(
+                    self, config: RunnableConfig
+                ) -> CheckpointTuple | None:
+                    async with self._db_lock:
+                        return await asyncio.to_thread(self.get_tuple, config)
+
+                async def aput(
+                    self,
+                    config: RunnableConfig,
+                    checkpoint: Checkpoint,
+                    metadata: CheckpointMetadata,
+                    new_versions: ChannelVersions,
+                ) -> RunnableConfig:
+                    async with self._db_lock:
+                        return await asyncio.to_thread(
+                            self.put, config, checkpoint, metadata, new_versions
+                        )
+
+                async def aput_writes(
+                    self,
+                    config: RunnableConfig,
+                    writes: Sequence[tuple[str, Any]],
+                    task_id: str,
+                    task_path: str = "",
+                ) -> None:
+                    async with self._db_lock:
+                        await asyncio.to_thread(
+                            self.put_writes, config, writes, task_id, task_path
+                        )
+
+                async def alist(
+                    self,
+                    config: RunnableConfig | None,
+                    *,
+                    filter: dict[str, Any] | None = None,
+                    before: RunnableConfig | None = None,
+                    limit: int | None = None,
+                ) -> AsyncIterator[CheckpointTuple]:
+                    # Collect under the lock, then yield after releasing it
+                    # so consumers can interleave other checkpoint calls.
+                    async with self._db_lock:
+
+                        def _collect() -> list[CheckpointTuple]:
+                            return list(
+                                self.list(
+                                    config,
+                                    filter=filter,
+                                    before=before,
+                                    limit=limit,
+                                )
+                            )
+
+                        items = await asyncio.to_thread(_collect)
+                    for item in items:
+                        yield item
+
             conn = psycopg.connect(
                 _with_required_ssl(
                     _with_connect_timeout(settings.DATABASE_URL, 2)
@@ -633,7 +720,10 @@ def build_checkpointer() -> BaseCheckpointSaver:
                 # PostgresSaver reads rows by column name (required).
                 row_factory=dict_row,
             )
-            checkpointer = PostgresSaver(conn)
+            # Async-compatible wrapper: the SSE endpoint streams via
+            # ``astream_events`` (AsyncPregelLoop), which requires the async
+            # checkpoint methods this subclass provides.
+            checkpointer = _AsyncCompatiblePostgresSaver(conn)
             checkpointer.setup()
             logger.info(
                 "Checkpointer: PostgresSaver (%s)",
