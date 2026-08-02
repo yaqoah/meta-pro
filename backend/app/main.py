@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 
+from app import resilience
 from app.config import settings
 from app.graph import NODE_NAMES, workflow
 from app.schemas import (
@@ -222,6 +223,10 @@ def api_health() -> dict:
             "groq_api_key": "set" if settings.GROQ_API_KEY else "unset",
             "cors_origins": settings.CORS_ORIGINS,
         },
+        # Circuit-breaker + pacing state (is the provider rate-limited?
+        # how long until the cooldown lifts? what is the effective pacing
+        # interval?) — see app.resilience.breaker_status().
+        "resilience": resilience.breaker_status(),
     }
 
 

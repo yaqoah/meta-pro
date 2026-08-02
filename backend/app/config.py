@@ -53,6 +53,23 @@ class Settings(BaseSettings):
     # --- Runtime guardrails ------------------------------------------------
     MAX_STEPS: int = 10
 
+    # --- Resilience / rate limiting ----------------------------------------
+    # Minimum seconds between LLM provider calls. One run fires ~13
+    # sequential calls, so pacing keeps a single-user server under a
+    # provider's requests-per-minute quota (Mistral's free tier is ~60 RPM
+    # with tight per-minute token ceilings) — runs get real content instead
+    # of rate-limited placeholders. 0 disables pacing.
+    MIN_LLM_INTERVAL_SECONDS: float = 15.0
+    # Upper bound (seconds) for honouring a provider's ``Retry-After`` hint
+    # before retrying a rate-limited call. Prevents a single retry from
+    # stalling the pipeline indefinitely.
+    MAX_RETRY_AFTER_SECONDS: float = 60.0
+    # Seconds a failed provider is kept on cooldown (shared by the app-level
+    # circuit breaker AND the LiteLLM Router deployment cooldown). While
+    # tripped, further LLM calls fast-fail so a rate-limited run degrades
+    # quickly instead of burning backoff sleeps.
+    BREAKER_COOLDOWN_SECONDS: float = 120.0
+
     # --- API / CORS ----------------------------------------------------------
     # Allowed browser origins (Vercel frontend + local dev). Override with a
     # JSON array in the environment, e.g. CORS_ORIGINS=["https://app.example.com"].

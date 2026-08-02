@@ -3,7 +3,9 @@
 Provides:
 - Multi-provider LLM routing via LiteLLM (Mistral primary, Groq fallback)
   with structured output via Instructor (``instructor.from_litellm``).
-- Tenacity retry with exponential backoff and a logging hook on retries.
+- Tenacity retry with Retry-After-aware exponential backoff, a global
+  request-pacing throttle (``MIN_LLM_INTERVAL_SECONDS``) and a logging
+  hook on retries.
 - ``call_llm_with_resilience`` entrypoint with chaos-engineering hooks.
 - Step-budget guard (``MAX_STEPS``) and cycle detection via state digests.
 """
@@ -13,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, TypeVar
 
@@ -21,7 +24,6 @@ from tenacity import (
     Retrying,
     before_sleep_log,
     stop_after_attempt,
-    wait_exponential,
 )
 
 from app.config import settings
@@ -128,12 +130,90 @@ def assert_no_cycle(state_hashes: list[str], digest: str) -> None:
 # LLM routing & retry layer
 # --------------------------------------------------------------------------
 
-# Tenacity policy: exponential backoff (multiplier=1, clamped to [2s, 10s]),
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Return the provider's ``Retry-After`` hint in seconds, if any.
+
+    Walks the exception and its ``__cause__`` (LiteLLM wraps the underlying
+    provider error, e.g. ``MistralException``) looking for an HTTP response
+    carrying a ``Retry-After`` header, plus any ``retry_after`` attribute
+    LiteLLM copied onto the exception directly. Returns ``None`` when the
+    provider did not signal a wait (non-429 failures, missing headers).
+    """
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if candidate is None:
+            continue
+        retry_after = getattr(candidate, "retry_after", None)
+        if isinstance(retry_after, (int, float)):
+            return float(retry_after)
+        response = getattr(candidate, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            continue
+        # httpx ``Headers`` is case-insensitive; plain dicts are not, so
+        # probe both spellings.
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """True when the failure chain is an HTTP 429 (provider rate limit)."""
+    for candidate in (exc, getattr(exc, "__cause__", None)):
+        if candidate is None:
+            continue
+        if getattr(candidate, "status_code", None) == 429:
+            return True
+        if getattr(candidate, "raw_status_code", None) == 429:
+            return True
+    return False
+
+
+# Upper bound on the total time one call may spend sleeping between
+# retries (``MAX_RETRY_AFTER_SECONDS`` + margin). Keeps a rate-limited run
+# from stalling for minutes: the first wait can honour a long Retry-After,
+# but the whole retry sequence still degrades within about a minute.
+_TOTAL_RETRY_BUDGET = settings.MAX_RETRY_AFTER_SECONDS + 15.0
+
+
+def _retry_wait(retry_state: Any) -> float:
+    """Tenacity wait: honour the provider's ``Retry-After``, else exponential.
+
+    The old fixed backoff (2s/4s/10s) slept *inside* Mistral's rate-limit
+    window, so every retry of a 429 failed again. When the provider says how
+    long to wait, wait that long (capped by ``MAX_RETRY_AFTER_SECONDS``);
+    otherwise fall back to the previous exponential schedule (2s, 4s, 8s, …
+    clamped to 10s). Every wait is clipped to the remaining
+    ``_TOTAL_RETRY_BUDGET`` so a fully rate-limited node degrades (breaker
+    trips, placeholders) within about a minute instead of re-waiting 60s
+    per attempt.
+    """
+    attempt = max(0, retry_state.attempt_number - 1)
+    backoff = min(2.0 * (2 ** attempt), 10.0)
+    budget_left = max(
+        0.0, _TOTAL_RETRY_BUDGET - retry_state.seconds_since_start
+    )
+    outcome = retry_state.outcome
+    if outcome is not None and outcome.exception() is not None:
+        retry_after = _extract_retry_after(outcome.exception())
+        if retry_after is not None:
+            return min(
+                max(backoff, min(retry_after, settings.MAX_RETRY_AFTER_SECONDS)),
+                budget_left,
+            )
+    return min(backoff, budget_left)
+
+
+# Tenacity policy: Retry-After-aware exponential backoff (see ``_retry_wait``),
 # at most 3 attempts, with a WARNING log hook before every retry sleep.
 # A Retrying instance (not the @retry decorator factory) so the policy is
 # directly inspectable — e.g. ``LLM_RETRY.stop.max_attempt_number``.
 LLM_RETRY = Retrying(
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    wait=_retry_wait,
     stop=stop_after_attempt(3),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
@@ -141,11 +221,11 @@ LLM_RETRY = Retrying(
 
 # Consecutive-failure circuit breaker. Once the provider has failed
 # ``_BREAKER_LIMIT`` calls in a row, further LLM calls fast-fail for
-# ``_BREAKER_COOLDOWN`` seconds instead of burning backoff retries — so a
-# rate-limited (429) or down provider degrades the rest of the run to
-# placeholders quickly rather than stalling every node on 2s/4s sleeps.
-# The breaker re-arms the provider after the cooldown so a recovered key
-# is retried; any success resets the failure count.
+# ``settings.BREAKER_COOLDOWN_SECONDS`` instead of burning backoff retries
+# — so a rate-limited (429) or down provider degrades the rest of the run
+# to placeholders quickly rather than stalling every node on backoff
+# sleeps. The breaker re-arms the provider after the cooldown so a
+# recovered key is retried; any success resets the failure count.
 #
 # ``_BREAKER_LIMIT`` intentionally matches ``LLM_RETRY``'s
 # ``stop_after_attempt(3)`` so the trip lands on the final retry. The state
@@ -153,9 +233,71 @@ LLM_RETRY = Retrying(
 # case is one extra provider call (a non-atomic ``+=`` race under concurrent
 # requests) or a degraded request while another request is on cooldown.
 _BREAKER_LIMIT = 3
-_BREAKER_COOLDOWN = 30.0  # seconds
 _breaker_failures = 0
 _breaker_tripped_at: float | None = None
+
+# --- Request pacing --------------------------------------------------------
+# Global throttle so a single-user server can never exceed a provider's
+# requests-per-minute quota (Mistral's free tier is ~60 RPM with tight
+# per-minute token ceilings — the 429s seen in the logs). Every provider
+# call waits until ``MIN_LLM_INTERVAL_SECONDS`` (+ any boost) has elapsed
+# since the previous one. After a 429 the interval is widened for a few
+# minutes so the provider has room to recover. Like the breaker, the state
+# is process-global; the lock only guards the pacing bookkeeping itself.
+_pacing_lock = threading.Lock()
+_last_call_at = 0.0
+_pacing_boost = 0.0  # extra seconds added after a 429
+_pacing_boost_at: float | None = None
+_PACING_BOOST_CAP = 120.0
+_PACING_BOOST_WINDOW = 300.0  # boost decays 5 minutes after the last 429
+
+
+def _effective_pacing_interval() -> float:
+    """Current min interval between provider calls (base + decayed boost)."""
+    global _pacing_boost, _pacing_boost_at
+    with _pacing_lock:
+        if _pacing_boost_at is not None and (
+            time.monotonic() - _pacing_boost_at > _PACING_BOOST_WINDOW
+        ):
+            _pacing_boost = 0.0
+            _pacing_boost_at = None
+        return settings.MIN_LLM_INTERVAL_SECONDS + _pacing_boost
+
+
+def _pace_call() -> None:
+    """Block until the pacing window allows the next provider call.
+
+    Reserves the next slot under the lock (so concurrent callers queue up
+    ``interval`` seconds apart), then sleeps *outside* the lock — a
+    ``/api/health`` probe or another call must never block on the sleep
+    itself.
+    """
+    interval = _effective_pacing_interval()
+    if interval <= 0:
+        return
+    with _pacing_lock:
+        global _last_call_at
+        now = time.monotonic()
+        next_slot = max(now, _last_call_at + interval)
+        _last_call_at = next_slot  # reserve this call's slot
+        wait = next_slot - now
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _note_rate_limited(retry_after: float | None) -> None:
+    """Widen the pacing interval after a 429 so the provider can recover.
+
+    Every 429 refreshes the boost window (a sustained rate limit keeps the
+    wider interval active) and raises the boost when the provider suggests
+    a longer wait than the current one.
+    """
+    global _pacing_boost, _pacing_boost_at
+    base = settings.MIN_LLM_INTERVAL_SECONDS
+    suggested = max(base * 2, retry_after or 0.0)
+    with _pacing_lock:
+        _pacing_boost = min(max(_pacing_boost, suggested), _PACING_BOOST_CAP)
+        _pacing_boost_at = time.monotonic()
 
 
 def _configure_litellm_router() -> None:
@@ -212,6 +354,14 @@ def _configure_litellm_router() -> None:
         model_list=model_list,
         fallbacks=fallbacks,
         num_retries=0,  # tenacity owns the retry policy in this app
+        # Pull a deployment out of rotation once it fails ``allowed_fails``
+        # times within a minute — LiteLLM cools a deployment down on 429s
+        # immediately. A rate-limited Mistral is therefore not hammered by
+        # the rest of the run: calls route to the fallback (when configured)
+        # or surface fast to the app-level breaker. The duration mirrors
+        # the app-level ``BREAKER_COOLDOWN_SECONDS``.
+        allowed_fails=2,
+        cooldown_time=settings.BREAKER_COOLDOWN_SECONDS,
     )
 
 
@@ -234,6 +384,7 @@ def _structured_completion(
         )
 
     client = instructor.from_litellm(_ROUTER.completion)
+    _pace_call()  # stay under the provider's requests-per-minute quota
     try:
         return client.create(
             model=model,
@@ -247,7 +398,11 @@ def _structured_completion(
         # Provider errors (429 rate limits, 5xx, timeouts, invalid
         # responses) must degrade the pipeline node, not crash the run.
         # Log the real cause so the server terminal shows why a node
-        # degraded (not just the frontend warning banner).
+        # degraded (not just the frontend warning banner). Rate limits
+        # additionally widen the pacing window for the rest of the run
+        # (``_note_rate_limited``) so the provider gets room to recover.
+        if _is_rate_limit(exc):
+            _note_rate_limited(_extract_retry_after(exc))
         logger.warning("LLM provider call failed: %s", exc)
         raise ProviderUnavailableError(
             f"LLM provider call failed: {exc}"
@@ -298,7 +453,7 @@ def call_llm_with_resilience(
     # retry-then-succeed scenarios are exercised regardless of global state.
     global _breaker_tripped_at
     if chaos_flag is None and _breaker_tripped_at is not None:
-        if time.monotonic() - _breaker_tripped_at < _BREAKER_COOLDOWN:
+        if time.monotonic() - _breaker_tripped_at < settings.BREAKER_COOLDOWN_SECONDS:
             raise ProviderUnavailableError(
                 "LLM provider on cooldown after repeated failures — "
                 "degrading to deterministic placeholders"
@@ -334,3 +489,38 @@ def call_llm_with_resilience(
             "chaos CORRUPT_SCHEMA: invalid payload at worker handoff"
         )
     return result
+
+
+def breaker_status() -> dict[str, Any]:
+    """Snapshot of the circuit-breaker + pacing state (for ``/api/health``).
+
+    Lets operators (and the frontend) see whether the provider is being
+    rate-limited, how long remains on the cooldown, and the effective
+    pacing interval. Reads are best-effort without locking the breaker
+    globals — consistent with the single-user, non-atomic design of the
+    breaker itself.
+    """
+    if _breaker_tripped_at is None:
+        remaining = 0.0
+    else:
+        remaining = max(
+            0.0,
+            settings.BREAKER_COOLDOWN_SECONDS
+            - (time.monotonic() - _breaker_tripped_at),
+        )
+    interval = _effective_pacing_interval()
+    return {
+        "circuit_breaker": {
+            "state": "open" if remaining > 0 else "closed",
+            "tripped": remaining > 0,
+            "remaining_cooldown_seconds": round(remaining, 1),
+            "cooldown_seconds": settings.BREAKER_COOLDOWN_SECONDS,
+        },
+        "pacing": {
+            "min_interval_seconds": settings.MIN_LLM_INTERVAL_SECONDS,
+            "boost_seconds": round(
+                max(0.0, interval - settings.MIN_LLM_INTERVAL_SECONDS), 1
+            ),
+            "effective_interval_seconds": round(interval, 1),
+        },
+    }
