@@ -1,5 +1,6 @@
 import { Check } from 'lucide-react';
 import type { HookOption } from '@/data/platforms';
+import MarkdownText from './MarkdownText';
 
 type Props = {
   hooks: HookOption[];
@@ -55,11 +56,13 @@ export default function HookEngine({ hooks, selectedId, onSelect }: Props) {
                     {hook.style}
                   </span>
                 </div>
+                {/* Headline & description are LLM-generated and can carry
+                    inline markdown (**bold**) — render it, not raw asterisks. */}
                 <p className="mt-2 font-serif text-lg italic text-white leading-snug">
-                  {hook.headline}
+                  <MarkdownText text={hook.headline} />
                 </p>
                 <p className="mt-2 text-sm text-neutral-500 leading-relaxed">
-                  {hook.description}
+                  <MarkdownText text={hook.description} />
                 </p>
               </div>
             </button>

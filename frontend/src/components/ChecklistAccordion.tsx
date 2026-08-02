@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { ChevronDown, Check } from 'lucide-react';
+import MarkdownText from './MarkdownText';
 
 type Props = {
   items: string[];
@@ -38,7 +39,12 @@ export default function ChecklistAccordion({ items }: Props) {
               {items.map((item, i) => (
                 <li key={i} className="flex items-start gap-3">
                   <Check className="mt-0.5 h-4 w-4 shrink-0 text-spark" strokeWidth={2.5} />
-                  <span className="text-sm text-neutral-400 leading-relaxed">{item}</span>
+                  {/* LLM output can carry inline markdown (**bold**) — render
+                      it instead of showing the raw asterisks. */}
+                  <MarkdownText
+                    text={item}
+                    className="text-sm text-neutral-400 leading-relaxed"
+                  />
                 </li>
               ))}
             </ul>
