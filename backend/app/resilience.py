@@ -123,11 +123,13 @@ LLM_RETRY = Retrying(
 
 
 def _configure_litellm_router() -> None:
-    """Route ``LLM_ALIAS`` to the primary model with automatic failover.
+    """Route ``LLM_ALIAS`` to the primary model with optional failover.
 
-    Both entries share ``LLM_ALIAS`` as ``model_name``, so LiteLLM treats
-    them as one failover group: primary Mistral, falling back to Groq on
-    provider errors / timeouts. No-op when the LiteLLM SDK is not installed.
+    The primary entry is Mistral. When ``GROQ_API_KEY`` is set, a second
+    entry sharing ``LLM_ALIAS`` is registered so LiteLLM treats the pair as
+    one failover group (Mistral → Groq on provider errors / timeouts). When
+    Groq is not configured, the router contains only Mistral — Groq is fully
+    optional. No-op when the LiteLLM SDK is not installed.
     """
     if not _llm_stack_available():
         return
@@ -139,20 +141,24 @@ def _configure_litellm_router() -> None:
             params["api_key"] = api_key
         return params
 
-    litellm.model_list = [
+    model_list = [
         {
             "model_name": LLM_ALIAS,
             "litellm_params": _params(
                 settings.PRIMARY_LLM_MODEL, settings.MISTRAL_API_KEY
             ),
         },
-        {
-            "model_name": LLM_ALIAS,
-            "litellm_params": _params(
-                settings.FALLBACK_LLM_MODEL, settings.GROQ_API_KEY
-            ),
-        },
     ]
+    if settings.GROQ_API_KEY:
+        model_list.append(
+            {
+                "model_name": LLM_ALIAS,
+                "litellm_params": _params(
+                    settings.FALLBACK_LLM_MODEL, settings.GROQ_API_KEY
+                ),
+            }
+        )
+    litellm.model_list = model_list
 
 
 if _llm_stack_available():

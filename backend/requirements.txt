@@ -15,5 +15,8 @@ redis
 psycopg[binary]
 psycopg-pool
 python-multipart
-groq
+# Media transcription — Mistral Voxtral via the official SDK. The Groq SDK
+# is intentionally absent: Groq is fully optional (emergency LLM fallback
+# only) and requires no installed package.
+mistralai>=2.0
 python-dotenv

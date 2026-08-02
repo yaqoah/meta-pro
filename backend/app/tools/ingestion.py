@@ -1,9 +1,12 @@
 """Media ingestion tool for Meta-Pro.
 
-Transcribes audio/video uploads via Groq's free Whisper API
-(``distil-whisper-large-v3`` by default) and gracefully falls back to raw
-text input when no media is provided or transcription fails — the result is
+Transcribes audio/video uploads via Mistral's Voxtral speech-to-text API
+(``voxtral-mini-latest`` by default) and gracefully falls back to raw text
+input when no media is provided or transcription fails — the result is
 seeded into ``MetaProState["transcript_text"]``.
+
+Transcription uses the same ``MISTRAL_API_KEY`` as the primary LLM, so no
+Groq API key is required anywhere in the pipeline.
 """
 
 from __future__ import annotations
@@ -20,12 +23,11 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WHISPER_MODEL = "distil-whisper-large-v3"
-# Higher-fidelity option; pass ``model=WHISPER_LARGE`` for better accuracy.
-WHISPER_LARGE = "whisper-large-v3"
+# Hard fallback used when ``MISTRAL_TRANSCRIPTION_MODEL`` is empty/unset.
+DEFAULT_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
 
-# Formats accepted by the Groq Whisper API (audio tracks are extracted from
-# video containers like mp4 by the service).
+# Formats accepted by the Mistral Voxtral transcription API (audio tracks are
+# extracted from video containers like mp4 by the service).
 SUPPORTED_FORMATS = ("flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "ogg", "wav", "webm")
 
 _MIME_BY_EXT = {
@@ -54,34 +56,39 @@ def transcribe_media(
     file_bytes: bytes,
     filename: str = "audio.mp3",
     content_type: str | None = None,
-    model: str = DEFAULT_WHISPER_MODEL,
+    model: str | None = None,
 ) -> str:
-    """Transcribe an audio/video upload via Groq's Whisper API.
+    """Transcribe an audio/video upload via Mistral's Voxtral API.
 
-    Returns the raw transcript text. Raises :class:`TranscriptionError` when
-    no API key is configured or the provider call fails.
+    Uses the official ``mistralai`` SDK (``client.audio.transcriptions``)
+    with the same ``MISTRAL_API_KEY`` used for LLM routing, so no separate
+    transcription key is needed. Returns the raw transcript text. Raises
+    :class:`TranscriptionError` when no API key is configured or the provider
+    call fails.
     """
-    if not settings.GROQ_API_KEY:
+    if not settings.MISTRAL_API_KEY:
         raise TranscriptionError(
-            "GROQ_API_KEY is not set — cannot transcribe media"
+            "MISTRAL_API_KEY is not set — cannot transcribe media"
         )
+    model = model or settings.MISTRAL_TRANSCRIPTION_MODEL or DEFAULT_TRANSCRIPTION_MODEL
     # Lazy import so the app boots (and degrades to raw-text input) in
-    # environments where the groq SDK is not installed.
+    # environments where the mistralai SDK is not installed.
     try:
-        from groq import Groq
+        # v2 SDK exposes the client at ``mistralai.client`` (the top-level
+        # ``mistralai`` namespace re-exports nothing).
+        from mistralai.client import Mistral
     except ImportError:
         raise TranscriptionError(
-            "The 'groq' package is not installed — cannot transcribe media"
+            "The 'mistralai' package is not installed — cannot transcribe media"
         ) from None
-    client = Groq(api_key=settings.GROQ_API_KEY)
-    response = client.audio.transcriptions.create(
-        file=(
-            filename,
-            file_bytes,
-            content_type or _guess_mime(filename),
-        ),
+    client = Mistral(api_key=settings.MISTRAL_API_KEY)
+    response = client.audio.transcriptions.complete(
         model=model,
-        response_format="json",
+        file={
+            "file_name": filename,
+            "content": file_bytes,
+            "content_type": content_type or _guess_mime(filename),
+        },
     )
     return response.text.strip()
 

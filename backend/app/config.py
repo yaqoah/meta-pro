@@ -18,9 +18,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- Provider API keys (used by instructor / litellm) -----------------
+    # --- Provider API keys ------------------------------------------------
+    # MISTRAL_API_KEY powers the primary LLM (instructor / litellm) and media
+    # transcription (Voxtral speech-to-text) — see tools/ingestion.py.
     MISTRAL_API_KEY: str = ""
+    # GROQ_API_KEY is optional: it only enables the emergency LLM fallback
+    # (see resilience.py). No Groq key is required to run or to transcribe.
     GROQ_API_KEY: str = ""
+    # Mistral Voxtral transcription model (see tools/ingestion.py). Pin an
+    # explicit version (e.g. "voxtral-mini-2602") for reproducibility.
+    MISTRAL_TRANSCRIPTION_MODEL: str = "voxtral-mini-latest"
 
     # --- LLM routing (LiteLLM failover group: primary → fallback) ---------
     PRIMARY_LLM_MODEL: str = "mistral/mistral-large-latest"
