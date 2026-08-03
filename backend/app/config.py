@@ -1,8 +1,14 @@
 """Application configuration loaded from environment variables / ``.env``."""
 
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Default comma-separated browser origins for ``ALLOWED_ORIGINS`` (used in
+#: production; development mode allows a wildcard origin instead).
+DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:3000"
 
 
 class Settings(BaseSettings):
@@ -17,6 +23,13 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # --- Deployment environment --------------------------------------------
+    # "development" (default): permissive CORS wildcard, no startup checks —
+    # ideal for local / Codespaces where forwarded ports use arbitrary origins.
+    # "production": strict startup checks (DATABASE_URL + MISTRAL_API_KEY are
+    # mandatory) and CORS restricted to the explicit ALLOWED_ORIGINS list.
+    ENVIRONMENT: Literal["development", "production"] = "development"
 
     # --- Provider API keys ------------------------------------------------
     # MISTRAL_API_KEY powers the primary LLM (instructor / litellm) and media
@@ -41,6 +54,9 @@ class Settings(BaseSettings):
     # LangGraph's in-memory ``MemorySaver``. Set DATABASE_URL to a Supabase
     # Supavisor connection string (see ``.env.example`` — no local Docker
     # Postgres is provisioned) to opt into persistent Postgres checkpointing.
+    # NOTE: in ``ENVIRONMENT=production`` a missing DATABASE_URL is a hard
+    # startup error (see ``_production_startup_checks``) — the in-memory /
+    # SQLite fallbacks are development conveniences only.
     DATABASE_URL: str = ""
     REDIS_URL: str = ""
 
@@ -71,12 +87,66 @@ class Settings(BaseSettings):
     BREAKER_COOLDOWN_SECONDS: float = 120.0
 
     # --- API / CORS ----------------------------------------------------------
-    # Allowed browser origins (Vercel frontend + local dev). Override with a
-    # JSON array in the environment, e.g. CORS_ORIGINS=["https://app.example.com"].
-    CORS_ORIGINS: list[str] = [
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ]
+    # Comma-separated browser origins allowed when ``ENVIRONMENT=production``
+    # (e.g. "https://app.vercel.app,https://staging.vercel.app"). In
+    # development the API serves a wildcard origin instead — see
+    # ``cors_origins`` / ``cors_allow_credentials``.
+    ALLOWED_ORIGINS: str = DEFAULT_ALLOWED_ORIGINS
+
+    # ------------------------------------------------------------------
+    # Derived CORS configuration
+    # ------------------------------------------------------------------
+    @property
+    def cors_origins(self) -> list[str]:
+        """Browser origins allowed by CORS.
+
+        - Development: wildcard ``["*"]`` — Codespaces, forwarded ports and
+          local tooling can call the API from any origin.
+        - Production: the explicit comma-separated ``ALLOWED_ORIGINS`` list —
+          set this to your deployed Vercel frontend domain(s).
+        """
+        if self.ENVIRONMENT != "production":
+            return ["*"]
+        return [
+            origin.strip()
+            for origin in self.ALLOWED_ORIGINS.split(",")
+            if origin.strip()
+        ]
+
+    @property
+    def cors_allow_credentials(self) -> bool:
+        """Whether the ``Access-Control-Allow-Credentials`` header is sent.
+
+        Browsers reject that header together with a wildcard
+        ``Access-Control-Allow-Origin: *``, so credentials are disabled in
+        development (wildcard) and enabled in production (explicit origins).
+        """
+        return "*" not in self.cors_origins
+
+    @model_validator(mode="after")
+    def _production_startup_checks(self) -> "Settings":
+        """Fail fast with an explicit error in production when required
+        configuration is missing — never silently degrade to the in-memory /
+        SQLite development fallbacks in ``ENVIRONMENT=production``."""
+        if self.ENVIRONMENT == "production":
+            missing = [
+                name
+                for name, value in (
+                    ("DATABASE_URL (Supabase Postgres)", self.DATABASE_URL),
+                    ("MISTRAL_API_KEY", self.MISTRAL_API_KEY),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "Production startup check failed — refusing to start: "
+                    "missing required environment variable(s): "
+                    + ", ".join(missing)
+                    + ". Set them in the Render dashboard / render.yaml "
+                    "(see backend/render.yaml), or run with "
+                    "ENVIRONMENT=development for permissive local mode."
+                )
+        return self
 
 
 @lru_cache(maxsize=1)

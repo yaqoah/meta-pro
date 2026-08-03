@@ -44,10 +44,13 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# CORS is environment-aware: development serves a wildcard origin (Codespaces /
+# forwarded ports), production restricts to the explicit ALLOWED_ORIGINS list
+# (see app.config.Settings.cors_origins / cors_allow_credentials).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
+    allow_origins=settings.cors_origins,
+    allow_credentials=settings.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -216,12 +219,13 @@ def api_health() -> dict:
             ),
         },
         "config": {
+            "environment": settings.ENVIRONMENT,
             "max_steps": settings.MAX_STEPS,
             "primary_llm_model": settings.PRIMARY_LLM_MODEL,
             "fallback_llm_model": settings.FALLBACK_LLM_MODEL,
             "mistral_api_key": "set" if settings.MISTRAL_API_KEY else "unset",
             "groq_api_key": "set" if settings.GROQ_API_KEY else "unset",
-            "cors_origins": settings.CORS_ORIGINS,
+            "cors_origins": settings.cors_origins,
         },
         # Circuit-breaker + pacing state (is the provider rate-limited?
         # how long until the cooldown lifts? what is the effective pacing
