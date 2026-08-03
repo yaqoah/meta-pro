@@ -32,10 +32,11 @@ services:
     envVars:
       - key: ENVIRONMENT
         value: production
-      # Comma-separated browser origins — replace with your deployed Vercel
-      # frontend domain(s). Development mode ignores this (wildcard CORS).
+      # Comma-separated browser origins — your deployed Vercel frontend
+      # domain(s). No trailing slash: origins are matched exactly against the
+      # browser Origin header. Development mode ignores this (wildcard CORS).
       - key: ALLOWED_ORIGINS
-        value: https://meta-pro.vercel.app
+        value: https://meta-pro-five.vercel.app
       # --- Secrets: set these in the Render dashboard (Settings → Environment)
       - key: DATABASE_URL
         sync: false

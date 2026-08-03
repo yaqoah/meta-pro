@@ -104,11 +104,17 @@ class Settings(BaseSettings):
           local tooling can call the API from any origin.
         - Production: the explicit comma-separated ``ALLOWED_ORIGINS`` list —
           set this to your deployed Vercel frontend domain(s).
+
+        Origins are matched **exactly** against the browser's ``Origin``
+        header (which never carries a trailing slash or path), so entries are
+        normalized: whitespace is trimmed and a stray trailing ``/`` is
+        stripped to keep ``https://app.example.com/`` and
+        ``https://app.example.com`` equivalent.
         """
         if self.ENVIRONMENT != "production":
             return ["*"]
         return [
-            origin.strip()
+            origin.strip().rstrip("/")
             for origin in self.ALLOWED_ORIGINS.split(",")
             if origin.strip()
         ]
