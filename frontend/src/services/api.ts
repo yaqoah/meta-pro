@@ -16,12 +16,14 @@
 // `import.meta.env` is injected by Vite; optional-chaining keeps this module
 // safe to import outside the bundler (tests, SSR) where it is undefined.
 //
-// Contract: VITE_API_BASE_URL is the backend API root **including the `/api`
-// prefix** (the dev fallback is literally '/api'). The stream endpoint is
-// requested as `${API_BASE_URL}/generate/stream`. Pointing this at a bare
-// origin (e.g. https://backend.onrender.com) makes the browser hit
-// /generate/stream directly and get FastAPI 404 "Not Found".
-const API_BASE_URL = (import.meta.env?.VITE_API_BASE_URL || '/api').replace(/\/+$/, '');
+// The backend serves its routes under `/api` (e.g. `/api/generate/stream`)
+// and the stream endpoint is requested as `${API_BASE_URL}/generate/stream`.
+// To be forgiving about the configured value, the base is normalized to the
+// API root: both a bare origin (https://backend.onrender.com) and the full
+// API root (https://backend.onrender.com/api) resolve to
+// https://backend.onrender.com/api. The dev fallback is literally '/api'.
+const rawApiBase = (import.meta.env?.VITE_API_BASE_URL || '/api').replace(/\/+$/, '');
+const API_BASE_URL = rawApiBase.replace(/\/api$/i, '') + '/api';
 
 /** Mirrors backend `app.schemas.PlatformType`. */
 export enum PlatformType {
